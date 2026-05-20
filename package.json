@@ -46,7 +46,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ]
     },
@@ -58,5 +60,8 @@
       "shortcutName": "Untrace"
     }
   },
-  "homepage": "https://developersharif.github.io/untrace"
+  "homepage": "https://developersharif.github.io/untrace",
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
 }

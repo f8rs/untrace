@@ -6,10 +6,12 @@
   import Footer from "./lib/Footer.svelte";
   import PrivacyInfo from "./lib/PrivacyInfo.svelte";
   import { processFile } from "./lib/processFile.js";
+  import JSZip from "jszip";
 
   let items = [];
   let showPrivacyInfo = false;
   let darkMode = false;
+  let zipping = false;
 
   $: anyProcessing = items.some((i) => i.status === "processing");
   $: idleCount = items.filter((i) => i.status === "idle").length;
@@ -92,19 +94,40 @@
     items = [];
   }
 
-  function downloadAll() {
-    items
-      .filter((i) => i.status === "done")
-      .forEach((item, idx) => {
-        setTimeout(() => {
-          const a = document.createElement("a");
-          a.href = item.result.url;
-          a.download = item.result.filename;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-        }, idx * 300);
-      });
+  async function downloadAll() {
+    const done = items.filter((i) => i.status === "done");
+    if (done.length === 0) return;
+
+    zipping = true;
+    try {
+      const zip = new JSZip();
+
+      await Promise.all(
+        done.map(async (item) => {
+          const resp = await fetch(item.result.url);
+          const blob = await resp.blob();
+          zip.file(item.result.filename, blob);
+        })
+      );
+
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      const ts =
+        `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+        `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(zipBlob);
+      a.download = `untrace-${ts}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
+    } finally {
+      zipping = false;
+    }
   }
 
   function formatSize(bytes) {
@@ -152,8 +175,12 @@
               </button>
             {/if}
             {#if doneCount > 0}
-              <button class="btn btn-success" on:click={downloadAll}>
-                ↓ Download All ({doneCount})
+              <button
+                class="btn btn-success"
+                on:click={downloadAll}
+                disabled={zipping}
+              >
+                {zipping ? "Zipping…" : `↓ Download All (${doneCount})`}
               </button>
             {/if}
             <button
