@@ -1,38 +1,31 @@
 <script>
   import { onMount } from "svelte";
   import ImageUploader from "./lib/ImageUploader.svelte";
-  import MetadataViewer from "./lib/MetadataViewer.svelte";
-  import ImageProcessor from "./lib/ImageProcessor.svelte";
   import ThemeToggle from "./lib/ThemeToggle.svelte";
   import Header from "./lib/Header.svelte";
   import Footer from "./lib/Footer.svelte";
   import PrivacyInfo from "./lib/PrivacyInfo.svelte";
+  import { processFile } from "./lib/processFile.js";
 
-  let selectedFile = null;
-  let metadata = null;
-  let processedImage = null;
-  let isProcessing = false;
-  let showMetadata = false;
-  let showFileInfo = false;
+  let items = [];
   let showPrivacyInfo = false;
   let darkMode = false;
 
+  $: anyProcessing = items.some((i) => i.status === "processing");
+  $: idleCount = items.filter((i) => i.status === "idle").length;
+  $: doneCount = items.filter((i) => i.status === "done").length;
+
   onMount(() => {
-    const savedTheme = localStorage.getItem("theme");
-    if (savedTheme) {
-      darkMode = savedTheme === "dark";
-    } else {
-      darkMode = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    }
+    const saved = localStorage.getItem("theme");
+    darkMode = saved
+      ? saved === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
     updateTheme();
   });
 
   function updateTheme() {
-    if (darkMode) {
-      document.documentElement.setAttribute("data-theme", "dark");
-    } else {
-      document.documentElement.removeAttribute("data-theme");
-    }
+    if (darkMode) document.documentElement.setAttribute("data-theme", "dark");
+    else document.documentElement.removeAttribute("data-theme");
     localStorage.setItem("theme", darkMode ? "dark" : "light");
   }
 
@@ -41,40 +34,83 @@
     updateTheme();
   }
 
-  function handleFileSelected(event) {
-    selectedFile = event.detail.file;
-    metadata = event.detail.metadata;
-    processedImage = null;
-    showMetadata = false;
+  function handleFilesSelected(event) {
+    const newFiles = event.detail.files;
+    const existingKeys = new Set(
+      items.map((i) => `${i.file.name}-${i.file.size}-${i.file.lastModified}`)
+    );
+    const toAdd = newFiles
+      .filter(
+        (f) =>
+          !existingKeys.has(`${f.name}-${f.size}-${f.lastModified}`)
+      )
+      .map((f) => ({
+        id: crypto.randomUUID(),
+        file: f,
+        previewUrl: URL.createObjectURL(f),
+        status: "idle",
+        result: null,
+      }));
+    items = [...items, ...toAdd];
   }
 
-  function handleProcessingStart() {
-    isProcessing = true;
+  function updateItem(id, patch) {
+    items = items.map((i) => (i.id === id ? { ...i, ...patch } : i));
   }
 
-  function handleProcessingComplete(event) {
-    isProcessing = false;
-    processedImage = event.detail.processedImage;
+  async function processAll() {
+    const idle = items.filter((i) => i.status === "idle");
+    await Promise.all(idle.map((item) => processSingle(item.id)));
   }
 
-  function handleReset() {
-    selectedFile = null;
-    metadata = null;
-    processedImage = null;
-    isProcessing = false;
-    showMetadata = false;
+  async function processSingle(id) {
+    const item = items.find((i) => i.id === id);
+    if (!item || item.status !== "idle") return;
+    updateItem(id, { status: "processing" });
+    try {
+      const result = await processFile(item.file);
+      updateItem(id, { status: "done", result });
+    } catch {
+      updateItem(id, { status: "error" });
+    }
   }
 
-  function toggleMetadata() {
-    showMetadata = !showMetadata;
+  function removeItem(id) {
+    const item = items.find((i) => i.id === id);
+    if (item) {
+      URL.revokeObjectURL(item.previewUrl);
+      if (item.result?.url) URL.revokeObjectURL(item.result.url);
+    }
+    items = items.filter((i) => i.id !== id);
   }
 
-  function toggleFileInfo() {
-    showFileInfo = !showFileInfo;
+  function clearAll() {
+    items.forEach((item) => {
+      URL.revokeObjectURL(item.previewUrl);
+      if (item.result?.url) URL.revokeObjectURL(item.result.url);
+    });
+    items = [];
   }
 
-  function togglePrivacyInfo() {
-    showPrivacyInfo = !showPrivacyInfo;
+  function downloadAll() {
+    items
+      .filter((i) => i.status === "done")
+      .forEach((item, idx) => {
+        setTimeout(() => {
+          const a = document.createElement("a");
+          a.href = item.result.url;
+          a.download = item.result.filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }, idx * 300);
+      });
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 </script>
 
@@ -84,146 +120,155 @@
   <Header />
 
   <div class="grid gap-6">
+    <!-- Upload -->
     <section class="card">
-      <div class="flex justify-between items-center mb-4">
-        <h2 class="text-xl font-bold">Upload Your Image</h2>
-      </div>
-
+      <h2 class="text-xl font-bold mb-4">Upload Images</h2>
       <ImageUploader
-        on:fileSelected={handleFileSelected}
-        on:reset={handleReset}
-        disabled={isProcessing}
+        on:filesSelected={handleFilesSelected}
+        disabled={anyProcessing}
       />
     </section>
 
-    <!-- Processing Section -->
-    {#if selectedFile}
-      <section class="grid grid-2 gap-6">
-        <div class="card">
-          <div class="flex justify-between items-center mb-3">
-            <h3 class="text-lg font-semibold">Original</h3>
-            {#if metadata}
-              <button class="btn btn-ghost text-sm" on:click={toggleMetadata}>
-                {showMetadata ? "Hide" : "Show"} Metadata
+    <!-- Items list -->
+    {#if items.length > 0}
+      <section class="card">
+        <!-- Toolbar -->
+        <div class="toolbar">
+          <span class="toolbar-info">
+            {items.length} image{items.length !== 1 ? "s" : ""}
+            {#if doneCount > 0}&bull; {doneCount} cleaned{/if}
+            {#if anyProcessing}&bull; processing…{/if}
+          </span>
+          <div class="toolbar-actions">
+            {#if idleCount > 0}
+              <button
+                class="btn btn-primary"
+                on:click={processAll}
+                disabled={anyProcessing}
+              >
+                Remove Metadata{idleCount < items.length
+                  ? ` (${idleCount})`
+                  : ""}
               </button>
             {/if}
-          </div>
-
-          <div class="text-center mb-3">
-            <img
-              src={URL.createObjectURL(selectedFile)}
-              alt="Original"
-              class="image-preview"
-            />
-          </div>
-
-          <div class="text-xs text-secondary">
-            <p>
-              {selectedFile.name} • {(selectedFile.size / 1024).toFixed(1)} KB
-            </p>
-            {#if metadata && metadata.message && !metadata.hasMetadata}
-              <p class="text-success">✓ No metadata detected</p>
-            {:else if metadata}
-              <p class="text-warning">
-                ⚠️ {Object.keys(metadata).filter(
-                  (key) => !["fileType", "hasMetadata", "message"].includes(key)
-                ).length} metadata entries found
-              </p>
+            {#if doneCount > 0}
+              <button class="btn btn-success" on:click={downloadAll}>
+                ↓ Download All ({doneCount})
+              </button>
             {/if}
+            <button
+              class="btn btn-ghost"
+              on:click={clearAll}
+              disabled={anyProcessing}
+            >
+              Clear All
+            </button>
           </div>
-
-          {#if showMetadata && metadata}
-            <div class="mt-4">
-              <MetadataViewer {metadata} />
-            </div>
-          {/if}
         </div>
 
-        <div class="card">
-          <h3 class="text-lg font-semibold mb-3">Clean Metadata</h3>
-          <ImageProcessor
-            file={selectedFile}
-            on:processingStart={handleProcessingStart}
-            on:processingComplete={handleProcessingComplete}
-            disabled={isProcessing}
-          />
+        <!-- Progress bar (while processing) -->
+        {#if anyProcessing}
+          <div class="progress-bar mt-4">
+            <div
+              class="progress-fill"
+              style="width: {(doneCount / items.length) * 100}%;"
+            ></div>
+          </div>
+          <p class="text-xs text-secondary mt-1">
+            {doneCount} / {items.length} processed
+          </p>
+        {/if}
 
-          {#if isProcessing}
-            <div class="mt-3">
-              <div class="progress-bar">
-                <div class="progress-fill" style="width: 100%;"></div>
-              </div>
-              <p class="text-xs text-secondary mt-1">Processing...</p>
-            </div>
-          {/if}
-
-          {#if processedImage}
-            <div class="mt-4 slide-up">
-              <h4 class="font-medium mb-2">✅ Clean Image</h4>
-              <div class="text-center mb-3">
-                <img
-                  src={processedImage.url}
-                  alt="Cleaned"
-                  class="image-preview"
-                />
-              </div>
-
-              <div class="text-xs text-secondary mb-3">
-                <p>
-                  {(processedImage.size / 1024).toFixed(1)} KB •
-                  {processedImage.compressionRatio
-                    ? `${processedImage.compressionRatio > 0 ? "-" : "+"}${Math.abs(processedImage.compressionRatio)}% size`
-                    : "Processed"}
-                </p>
-                {#if processedImage.wasSecondPass}
-                  <p class="status-warning">
-                    ⚠️ Used enhanced cleaning (second pass)
-                  </p>
+        <!-- Grid -->
+        <div class="items-grid mt-4">
+          {#each items as item (item.id)}
+            <div
+              class="item-card"
+              class:item-done={item.status === "done"}
+              class:item-error={item.status === "error"}
+            >
+              <!-- Thumbnail -->
+              <div class="item-thumb">
+                <img src={item.previewUrl} alt={item.file.name} />
+                {#if item.status === "processing"}
+                  <div class="thumb-overlay">
+                    <div class="spinner"></div>
+                  </div>
+                {:else if item.status === "done"}
+                  <div class="thumb-badge badge-done">✓</div>
+                {:else if item.status === "error"}
+                  <div class="thumb-badge badge-error">✕</div>
                 {/if}
-                <p class="status-success">✓ All EXIF metadata removed</p>
-                <p class="status-success">✓ GPS location data cleared</p>
-                <p class="status-success">✓ AI content credentials stripped</p>
-                <p class="status-success">✓ C2PA provenance data removed</p>
-                <p class="status-success">✓ Camera & device info cleared</p>
               </div>
 
-              <a
-                href={processedImage.url}
-                download={processedImage.filename}
-                class="btn btn-success btn-lg w-full"
-              >
-                <svg
-                  width="20"
-                  height="20"
-                  fill="currentColor"
-                  viewBox="0 0 20 20"
+              <!-- Info -->
+              <div class="item-body">
+                <p class="item-name" title={item.file.name}>
+                  {item.file.name}
+                </p>
+                <p class="item-size">
+                  {formatSize(item.file.size)}
+                  {#if item.status === "done"}
+                    → {formatSize(item.result.size)}
+                    {#if item.result.compressionRatio > 0}
+                      <span class="text-success"
+                        >(−{item.result.compressionRatio}%)</span
+                      >
+                    {/if}
+                  {:else if item.status === "processing"}
+                    <span class="text-secondary">Processing…</span>
+                  {:else if item.status === "error"}
+                    <span class="text-error">Failed</span>
+                  {/if}
+                </p>
+              </div>
+
+              <!-- Actions -->
+              <div class="item-actions">
+                {#if item.status === "done"}
+                  <a
+                    href={item.result.url}
+                    download={item.result.filename}
+                    class="btn btn-success btn-sm flex-1"
+                  >
+                    ↓ Download
+                  </a>
+                {:else if item.status === "idle"}
+                  <button
+                    class="btn btn-primary btn-sm flex-1"
+                    on:click={() => processSingle(item.id)}
+                    disabled={anyProcessing}
+                  >
+                    Clean
+                  </button>
+                {/if}
+                <button
+                  class="btn btn-ghost btn-sm icon-btn"
+                  on:click={() => removeItem(item.id)}
+                  title="Remove"
+                  disabled={item.status === "processing"}
                 >
-                  <path
-                    fill-rule="evenodd"
-                    d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-                Download Cleaned Image
-              </a>
+                  ✕
+                </button>
+              </div>
             </div>
-          {/if}
+          {/each}
         </div>
       </section>
     {/if}
 
+    <!-- Privacy section -->
     <section class="card">
       <div class="flex justify-between items-center mb-4">
         <h2 class="text-xl font-bold">🔐 Privacy & Security</h2>
         <button
           class="btn btn-ghost text-sm"
-          on:click={togglePrivacyInfo}
+          on:click={() => (showPrivacyInfo = !showPrivacyInfo)}
           type="button"
         >
           {showPrivacyInfo ? "Hide" : "Show"} Details
         </button>
       </div>
-
       <div class="mb-3">
         <p class="text-sm text-secondary">
           <span class="text-success font-semibold">✓</span> 100% client-side
@@ -234,7 +279,6 @@
           <span class="text-success font-semibold">✓</span> Open source
         </p>
       </div>
-
       {#if showPrivacyInfo}
         <PrivacyInfo />
       {/if}
@@ -245,91 +289,184 @@
 <Footer />
 
 <style>
-  .w-full {
-    width: 100%;
-  }
-
-  .status-warning {
-    color: var(--warning-color, #f59e0b);
-  }
-
-  .image-preview {
-    max-width: 100%;
-    max-height: 200px;
-    border-radius: 8px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-  }
-
-  .progress-bar {
-    width: 100%;
-    height: 4px;
-    background-color: var(--border-color);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .progress-fill {
-    height: 100%;
-    background-color: var(--primary-color);
-    animation: pulse 1s ease-in-out infinite;
-  }
-
-  .slide-up {
-    animation: slideUp 0.3s ease-out;
-  }
-
-  @keyframes slideUp {
-    from {
-      opacity: 0;
-      transform: translateY(10px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-
-  @keyframes pulse {
-    0%,
-    100% {
-      opacity: 1;
-    }
-    50% {
-      opacity: 0.5;
-    }
-  }
-
-  .btn-ghost {
-    background: transparent;
-    border: 1px solid var(--border-color);
-    color: var(--text-secondary);
-  }
-
-  .btn-ghost:hover {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
   .grid {
     display: grid;
     gap: 1.5rem;
   }
 
-  .grid-2 {
-    grid-template-columns: 1fr 1fr;
+  /* Toolbar */
+  .toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .toolbar-info {
+    font-weight: 500;
+  }
+  .toolbar-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
-  @media (max-width: 768px) {
-    .grid-2 {
-      grid-template-columns: 1fr;
-    }
+  /* Progress */
+  .progress-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--border-color);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--primary-color);
+    transition: width 0.3s ease;
+  }
 
-    .image-preview {
-      max-height: 150px;
+  /* Items grid */
+  .items-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 1rem;
+  }
+
+  /* Item card */
+  .item-card {
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    transition: box-shadow 0.2s;
+  }
+  .item-card:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  }
+  .item-done {
+    border-color: var(--success-color);
+  }
+  .item-error {
+    border-color: #ef4444;
+  }
+
+  /* Thumbnail */
+  .item-thumb {
+    position: relative;
+    height: 130px;
+    overflow: hidden;
+    background: var(--bg-secondary);
+  }
+  .item-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .thumb-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .thumb-badge {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: bold;
+    color: white;
+  }
+  .badge-done {
+    background: var(--success-color);
+  }
+  .badge-error {
+    background: #ef4444;
+  }
+
+  /* Spinner */
+  .spinner {
+    width: 1.75rem;
+    height: 1.75rem;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-top-color: white;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
     }
   }
 
+  /* Item body */
+  .item-body {
+    padding: 0.6rem 0.75rem;
+    flex: 1;
+  }
+  .item-name {
+    font-size: 0.8rem;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.2rem;
+  }
+  .item-size {
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+  }
+
+  /* Item actions */
+  .item-actions {
+    padding: 0.5rem 0.6rem;
+    display: flex;
+    gap: 0.4rem;
+    border-top: 1px solid var(--border-color);
+    align-items: center;
+  }
+  .flex-1 {
+    flex: 1;
+  }
+  .icon-btn {
+    padding: 0.25rem 0.5rem;
+    flex-shrink: 0;
+  }
+
+  /* Text helpers */
   .text-secondary {
     color: var(--text-secondary);
+  }
+  .text-success {
+    color: var(--success-color);
+  }
+  .text-error {
+    color: #ef4444;
+  }
+  .text-sm {
+    font-size: 0.875rem;
+  }
+  .text-xs {
+    font-size: 0.75rem;
+  }
+
+  /* Btn ghost */
+  .btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+  }
+  .btn-ghost:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
   }
 </style>
